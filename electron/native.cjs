@@ -16,6 +16,7 @@ const SERVER_PATHS = [
   "/Applications/VirtualHereServerUniversal.app",
   join(homedir(), "Applications/VirtualHereServerUniversal.app"),
 ];
+const READ_CACHE_MS = 750;
 
 const ACTIONS = Object.freeze({
   use: "USE",
@@ -107,12 +108,22 @@ function parseClientList(reply) {
   for (const rawLine of reply.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (!line || /^VirtualHere (Client|IPC)/i.test(line) || /^\(Value in brackets/i.test(line)) continue;
-    const device = line.match(/^(\*\s*)?-->\s+(.+?)\s+\(([^()]+)\)(.*)$/);
-    if (device && server) {
-      const [, autoMarker, name, address, suffix] = device;
+    const device = line.match(/^(\*\s*)?-->\s+(.+)$/);
+    if (device) {
+      if (!server) continue;
+      const [, autoMarker, body] = device;
+      const ownerStart = body.search(/\(In[- ]use by\b/i);
+      const addressArea = ownerStart < 0 ? body : body.slice(0, ownerStart);
+      const addresses = [...addressArea.matchAll(/\(([^()\s,]+\.[0-9]+(?:\.[0-9]+)*)\)/g)];
+      const match = addresses.at(-1);
+      if (!match) continue;
+      const name = addressArea.slice(0, match.index).trim();
+      if (!name) continue;
+      const address = match[1];
+      const suffix = body.slice(match.index + match[0].length);
       server.devices.push({
-        name: name.trim(),
-        address: address.trim(),
+        name,
+        address,
         inUse: /\bIn[- ]use by\b/i.test(suffix),
         localUse: /\bIn[- ]use by you\b/i.test(suffix),
         autoUse: Boolean(autoMarker) || /\bAuto-Use\b/i.test(suffix),
@@ -130,6 +141,24 @@ function parseClientList(reply) {
     if (flag) flags[flag[1].toLowerCase().replaceAll(" ", "-")] = flag[2].toLowerCase() === "on";
   }
   return { servers, flags };
+}
+
+function parseServerProcesses(reply, serverApp) {
+  const executable = join(serverApp, "Contents/MacOS/vhusbdosx");
+  return reply.split(/\r?\n/).some((line) => {
+    const command = line.replace(/^\s*\d+\s+/, "").trim();
+    return command === executable || command.startsWith(`${executable} `);
+  });
+}
+
+function clientError(result, reply) {
+  if (reply === "IPC ERROR") return "The VirtualHere client is not running. Open it and refresh.";
+  if (/IPC client AF_UNIX connect error 2\b/i.test(result.stderr)) {
+    return "The VirtualHere client is not running. Open it and refresh.";
+  }
+  if (/^FAILED$/i.test(reply)) return "The native client could not complete the request. Check device availability and retry.";
+  if (/^ERROR:/i.test(reply)) return reply;
+  return result.stderr.trim() || reply || `The native client exited with code ${result.code ?? "unknown"}`;
 }
 
 function parseClientStateXml(reply) {
@@ -153,6 +182,11 @@ function parseClientStateXml(reply) {
 }
 
 function createNativeService({ clientPaths = CLIENT_PATHS, serverPaths = SERVER_PATHS, logPath = join(homedir(), "vhusbd_log.txt") } = {}) {
+  let commandTail = Promise.resolve();
+  let commandGeneration = 0;
+  const pendingReads = new Map();
+  const readCache = new Map();
+
   async function findPaths() {
     const [client, serverApp] = await Promise.all([
       firstAvailable(clientPaths, true),
@@ -161,14 +195,21 @@ function createNativeService({ clientPaths = CLIENT_PATHS, serverPaths = SERVER_
     return { client, serverApp };
   }
 
-  async function queryClient(command) {
+  async function executeClient(command, requireOk) {
     const { client } = await findPaths();
     if (!client) return { available: false, reason: "Install and launch the official VirtualHere client to connect devices" };
     try {
       const result = await run(client, ["-t", command]);
       const reply = result.stdout.trim();
       if (result.code !== 0 || reply === "IPC ERROR" || /^(FAILED|ERROR:)/i.test(reply)) {
-        return { available: false, reason: reply || result.stderr.trim() || "The native client did not respond", reply, client };
+        return { available: false, reason: clientError(result, reply), reply, client };
+      }
+      if (!reply) return { available: false, reason: "The native client returned an empty response", reply, client };
+      if (command === "LIST" && !/\bVirtualHere(?: Client)? IPC\b|\bAuto-Find currently (?:on|off)\b/i.test(reply)) {
+        return { available: false, reason: "The native client returned an unrecognized device list", reply, client };
+      }
+      if (requireOk && reply !== "OK") {
+        return { available: false, reason: "The native client returned an unexpected command response", reply, client };
       }
       return { available: true, reply, client };
     } catch (error) {
@@ -176,8 +217,38 @@ function createNativeService({ clientPaths = CLIENT_PATHS, serverPaths = SERVER_
     }
   }
 
+  function queryClient(command, readOnly = false, requireOk = false) {
+    if (!readOnly) {
+      commandGeneration += 1;
+      readCache.clear();
+    }
+    const generation = commandGeneration;
+    const key = `${generation}:${command}`;
+    if (readOnly) {
+      const cached = readCache.get(key);
+      if (cached && cached.expiresAt > Date.now()) return Promise.resolve(cached.result);
+      const pending = pendingReads.get(key);
+      if (pending) return pending;
+    }
+    // The client API uses shared IPC endpoints, so only one -t process may run at a time.
+    const task = commandTail.then(() => executeClient(command, requireOk));
+    commandTail = task.then(() => undefined, () => undefined);
+    if (readOnly) {
+      pendingReads.set(key, task);
+      task.then((result) => {
+        if (pendingReads.get(key) === task) pendingReads.delete(key);
+        if (generation === commandGeneration && result.available) {
+          readCache.set(key, { result, expiresAt: Date.now() + READ_CACHE_MS });
+        }
+      }, () => {
+        if (pendingReads.get(key) === task) pendingReads.delete(key);
+      });
+    }
+    return task;
+  }
+
   async function getState() {
-    const result = await queryClient("LIST");
+    const result = await queryClient("LIST", true);
     return {
       ...result,
       ...(result.available ? parseClientList(result.reply) : { servers: [], flags: {} }),
@@ -186,7 +257,7 @@ function createNativeService({ clientPaths = CLIENT_PATHS, serverPaths = SERVER_
   }
 
   async function getDetailedState() {
-    const result = await queryClient("GET CLIENT STATE");
+    const result = await queryClient("GET CLIENT STATE", true);
     return result.available ? { ...result, ...parseClientStateXml(result.reply) } : { ...result, document: null, parseError: null };
   }
 
@@ -202,22 +273,23 @@ function createNativeService({ clientPaths = CLIENT_PATHS, serverPaths = SERVER_
     } else if (input.value !== undefined) {
       throw new TypeError("This command does not accept a value");
     }
-    return queryClient(parts.join(","));
+    const requireOk = input.action !== "device-info" && input.action !== "server-info";
+    return queryClient(parts.join(","), false, requireOk);
   }
 
-  async function serverStatus() {
-    const { serverApp } = await findPaths();
+  async function serverStatus(serverApp) {
     if (!serverApp) return { installed: false, running: false };
     try {
       const result = await run("/usr/bin/pgrep", ["-fl", "VirtualHereServerUniversal|vhusbdosx"], 3000);
-      return { installed: true, running: result.code === 0, serverApp };
+      return { installed: true, running: result.code === 0 && parseServerProcesses(result.stdout, serverApp), serverApp };
     } catch {
       return { installed: true, running: null, serverApp };
     }
   }
 
   async function getStatus() {
-    const [paths, server] = await Promise.all([findPaths(), serverStatus()]);
+    const paths = await findPaths();
+    const server = await serverStatus(paths.serverApp);
     return { paths, server };
   }
 
@@ -233,7 +305,13 @@ function createNativeService({ clientPaths = CLIENT_PATHS, serverPaths = SERVER_
   }
 
   async function readServerLog() {
-    const file = await open(logPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    let file;
+    try {
+      file = await open(logPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    } catch (error) {
+      if (error.code === "ENOENT") return { text: "", truncated: false };
+      throw error;
+    }
     try {
       const info = await file.stat();
       if (!info.isFile()) throw new Error("Server log is not a regular file");
@@ -249,4 +327,4 @@ function createNativeService({ clientPaths = CLIENT_PATHS, serverPaths = SERVER_
   return { findPaths, getState, getDetailedState, getStatus, sendCommand, openApp, readServerLog };
 }
 
-module.exports = { createNativeService, parseClientList, parseClientStateXml };
+module.exports = { createNativeService, parseClientList, parseClientStateXml, parseServerProcesses };

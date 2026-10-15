@@ -11,6 +11,7 @@ contextBridge.exposeInMainWorld("softconnect", Object.freeze({
   readServerLog: () => ipcRenderer.invoke("softconnect:server-log"),
   openServer: () => ipcRenderer.invoke("softconnect:open-server"),
   openClient: () => ipcRenderer.invoke("softconnect:open-client"),
+  openClientDownload: () => ipcRenderer.invoke("softconnect:client-download"),
   onEvent: (callback) => {
     if (typeof callback !== "function") throw new TypeError("Event handler must be a function");
     const listener = (_event, value) => callback(value);

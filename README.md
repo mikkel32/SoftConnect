@@ -7,12 +7,13 @@ SoftConnect is a macOS desktop control center for shared USB devices. Its React 
 ## What it does
 
 - Discover servers and devices through the installed native client.
-- Search and filter available, connected, and occupied devices.
+- Search and filter available, connected, and occupied devices (Command-K focuses search).
 - Connect or release a device, inspect properties, rename it, configure auto use, and add a manual server through explicit actions.
 - Show a window-local activity timeline and native integration status.
 - Explore the interface in a clearly labeled Preview mode that never touches USB hardware.
+- Open the official client download page from the app when the native client is missing.
 
-SoftConnect does not bundle VirtualHere or replace its USB driver. Install and run the [official macOS client](https://www.virtualhere.com/usb_client_software) to use real USB devices. A server is needed on the machine physically holding those devices. The app detects supported install locations and keeps real device actions unavailable until the client responds.
+SoftConnect does not bundle VirtualHere or replace its USB driver. Install and run the [official macOS client](https://www.virtualhere.com/usb_client_software) to use real USB devices. A server is needed on the machine physically holding those devices. The app detects supported install locations and keeps real device actions unavailable until the client responds. A successful API response to Connect means the request was accepted; the device is shown as connected only when a later client state read confirms local ownership.
 
 ## Download and run
 
@@ -36,7 +37,7 @@ Build output is written under `release/` and is excluded from Git. `npm run buil
 
 ## Architecture and trust boundary
 
-The Electron renderer uses context isolation and cannot invoke Node.js directly. The preload exposes only selected SoftConnect methods. The main process invokes allowlisted `-t` commands with direct arguments and bounded output; no command shell is used. Network navigation is disabled. See [architecture](docs/ARCHITECTURE.md) for the runtime boundaries and research basis.
+The Electron renderer uses context isolation and cannot invoke Node.js directly. The preload exposes only selected SoftConnect methods. The main process invokes allowlisted `-t` commands with direct arguments and bounded output; no command shell is used. Repeated state reads are coalesced, native commands are serialized, and background polling pauses while the window is hidden. Network navigation is disabled inside the app; the official client page opens in the system browser through one fixed, allowlisted action. See [architecture](docs/ARCHITECTURE.md) for the runtime boundaries and research basis.
 
 The official macOS client has Apple's managed USB host-controller entitlement. SoftConnect does not have that entitlement and does not claim a separate virtual USB transport. Real USB attachment remains provided by the installed client. The app contains no vendor code, binaries, icons, license keys, or decompiled resources. SoftConnect is an independent interface and is not endorsed by VirtualHere.
 

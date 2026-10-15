@@ -1,7 +1,7 @@
 {
   "name": "softconnect",
   "productName": "SoftConnect",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "private": true,
   "description": "A local desktop control center for compatible USB sharing clients",
   "main": "electron/main.cjs",

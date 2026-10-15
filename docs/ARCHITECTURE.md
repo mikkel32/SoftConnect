@@ -22,7 +22,9 @@ local process table       installed VirtualHere client -t command
                               official USB client/driver
 ```
 
-The main process invokes only documented client API verbs with direct argument vectors. It validates fields, bounds output, applies a timeout, and never uses a shell to assemble commands. Device discovery and state polling are read-only. Use, release, auto-use, rename, and manual server changes require a direct UI action. The official client remains responsible for USB attachment, transport, and device drivers.
+The main process invokes only documented client API verbs with direct argument vectors. It validates fields, bounds output, applies a timeout, and never uses a shell to assemble commands. It serializes calls into the native client's shared IPC endpoint and coalesces repeated read requests. The renderer polls less often while the client is offline and pauses timed reads while hidden. Device discovery and state polling are read-only. Use, release, auto-use, rename, and manual server changes require a direct UI action. The official client remains responsible for USB attachment, transport, and device drivers.
+
+A successful `USE` reply means the native client accepted the request. SoftConnect reports local connection only after `LIST` confirms ownership. The app can open the exact official client download page in the system browser; the renderer cannot navigate to arbitrary network locations.
 
 SoftConnect does not include VirtualHere binaries, credentials, configuration files, or copied application resources. The user installs the official software separately. The app stores no cloud account or telemetry.
 
