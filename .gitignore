@@ -1,0 +1,14 @@
+node_modules/
+dist/
+release/
+assets/*.icns
+.DS_Store
+.env
+.env.*
+*.dmg
+*.app/
+*.har
+*.log
+downloads/
+rea-evidence/
+work/
