@@ -45,13 +45,21 @@ export const Sidebar = memo(function Sidebar({ view, mode, connectedCount, versi
   );
 });
 
-export const Topbar = memo(function Topbar({ title, mode, syncing, onRefresh }) {
+export const Topbar = memo(function Topbar({ title, mode, syncing, update, onRefresh, onInstallUpdate, onShowUpdates }) {
   const info = MODES[mode];
   const spinning = syncing || mode === "checking";
   return (
     <header className="topbar">
       <div className="breadcrumbs"><span>Workspace</span><Icon name="chevron" size={13}/><strong>{title}</strong></div>
       <div className="top-actions">
+        {update?.state === "ready" && (
+          <button className="button small primary" onClick={onInstallUpdate} title={`Install SoftConnect ${update.latestVersion} and restart`}>
+            <Icon name="refresh" size={13}/>Restart to update
+          </button>
+        )}
+        {update?.state === "available" && !update.autoUpdate && (
+          <button className="button small quiet" onClick={onShowUpdates}>Update available</button>
+        )}
         <span className={`mode-chip tone-${info.tone}`}><span aria-hidden="true"/>{info.chip}</span>
         <button className="icon-button" onClick={onRefresh} disabled={syncing} title="Refresh  ⌘R" aria-label="Refresh device list">
           <Icon name="refresh" size={16} className={spinning ? "spinning" : undefined}/>

@@ -1,0 +1,108 @@
+name: Release
+
+# Every merge to main that changes the app publishes a signed release, and installed copies of
+# SoftConnect download it in the background and install it when they quit.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "electron/**"
+      - "src/**"
+      - "scripts/**"
+      - "index.html"
+      - "package.json"
+      - "package-lock.json"
+      - "vite.config.js"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  signing:
+    runs-on: ubuntu-latest
+    outputs:
+      enabled: ${{ steps.check.outputs.enabled }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: check
+        env:
+          SOFTCONNECT_UPDATE_KEY: ${{ secrets.SOFTCONNECT_UPDATE_KEY }}
+        run: |
+          if ! node -e "process.exit(require('./electron/update-key.cjs').UPDATE_PUBLIC_KEY ? 0 : 1)"; then
+            echo "::notice title=Release skipped::Automatic updates are not set up yet. Run 'npm run update-key' once on a Mac with the GitHub CLI and commit electron/update-key.cjs."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -z "$SOFTCONNECT_UPDATE_KEY" ]; then
+            echo "::error title=Signing key missing::electron/update-key.cjs has a public key, but the SOFTCONNECT_UPDATE_KEY secret is not set. Run 'npm run update-key' again."
+            exit 1
+          fi
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: signing
+    if: needs.signing.outputs.enabled == 'true'
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm test
+
+      # major.minor come from package.json; the patch number is this workflow's run number,
+      # so every merge produces a strictly newer version without a version-bump commit.
+      - name: Choose version
+        id: version
+        run: |
+          base=$(node -p "require('./package.json').version.split('.').slice(0, 2).join('.')")
+          version="$base.$GITHUB_RUN_NUMBER"
+          if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
+            echo "::error::Tag v$version already exists."
+            exit 1
+          fi
+          npm version "$version" --no-git-tag-version
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Release notes
+        run: |
+          previous=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)
+          if [ -n "$previous" ]; then range="$previous..HEAD"; else range=HEAD; fi
+          # -n instead of piping to head: under pipefail, head closing the pipe would fail the step.
+          git log -n 40 --no-merges --format='- %s' "$range" > "$RUNNER_TEMP/release-notes.md"
+          cat "$RUNNER_TEMP/release-notes.md"
+
+      - name: Build and package
+        run: npm run pack:mac
+        env:
+          SOFTCONNECT_PACKAGE_OUT: ${{ runner.temp }}/release
+
+      - name: Sign update manifest
+        env:
+          SOFTCONNECT_UPDATE_KEY: ${{ secrets.SOFTCONNECT_UPDATE_KEY }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: node scripts/release-manifest.mjs "$VERSION" "$RUNNER_TEMP/release" "$RUNNER_TEMP/release-notes.md"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          gh release create "v$VERSION" \
+            "$RUNNER_TEMP"/release/SoftConnect-"$VERSION"-mac-*.zip \
+            "$RUNNER_TEMP/release/softconnect-update.json" \
+            "$RUNNER_TEMP/release/softconnect-update.json.sig" \
+            --title "SoftConnect $VERSION" \
+            --notes-file "$RUNNER_TEMP/release-notes.md" \
+            --target "$GITHUB_SHA"

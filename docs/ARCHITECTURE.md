@@ -28,6 +28,23 @@ The renderer polls every 8 seconds while the client is live and the window is fo
 
 A successful `USE` reply means the native client accepted the request. SoftConnect reports local connection only after `LIST` confirms ownership. The app can open the exact official client download page in the system browser; the renderer cannot navigate to arbitrary network locations.
 
+## Updates
+
+The renderer's session cancels every HTTP and HTTPS request. Update traffic comes only from the main process, through a separate in-memory session, to `api.github.com/repos/mikkel32/SoftConnect/releases/latest` and to this repository's release download URLs (which GitHub redirects to its asset storage).
+
+```text
+GitHub release ──► softconnect-update.json + .sig ──► Ed25519 verify (public key in the app)
+                                                        │
+                   SoftConnect-<v>-mac-<arch>.zip ──────┴─► size + SHA-256 from the manifest
+                                                              │
+         <app folder>/.SoftConnect-update/SoftConnect.app ◄───┘ ditto -x -k
+                    │  bundle id, version, codesign --verify --deep --strict
+                    ▼
+ will-quit or "Restart to update": rename installed → backup, staged → installed (rolled back on failure)
+```
+
+The release workflow signs the manifest with the `SOFTCONNECT_UPDATE_KEY` secret and refuses to publish if that key does not match the public key committed in `electron/update-key.cjs`, so a release can never be one the shipped apps reject. The updater installs only versions newer than its own, which blocks replaying an older signed release. Ad hoc signing gives no publisher identity, so the Ed25519 key is the trust root for updates; anyone who can both push to `main` and use the repository's Actions secrets can ship an update.
+
 SoftConnect does not include VirtualHere binaries, credentials, configuration files, or copied application resources. The user installs the official software separately. The app stores no cloud account or telemetry.
 
 ## Evidence and implementation choices

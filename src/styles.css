@@ -305,6 +305,22 @@ label.setting-row { cursor: pointer; }
 .about-panel p { max-width: 720px; margin-top: 3px; color: var(--text-4); font-size: var(--fs-sm); }
 .about-panel > span { color: var(--text-3); font-size: var(--fs-sm); font-variant-numeric: tabular-nums; }
 
+.settings-row { margin-top: 16px; }
+.settings-row .shortcuts-panel { margin-top: 0; }
+.version-pill { padding: 3px 9px; border: 1px solid var(--line-strong); border-radius: 999px; color: var(--text-2); font-size: var(--fs-sm); font-variant-numeric: tabular-nums; }
+.update-status { display: flex; align-items: center; gap: 12px; padding: 13px 18px; border-top: 1px solid var(--line-soft); }
+.update-status > div { min-width: 0; }
+.update-status strong { display: block; font-size: var(--fs-md); font-weight: 620; }
+.update-status small { display: block; margin-top: 2px; color: var(--text-4); font-size: var(--fs-sm); }
+.update-ready .row-icon { background: var(--accent-soft); color: var(--accent); }
+.update-error .row-icon { background: var(--red-soft); color: var(--red); }
+.update-error strong { color: var(--red); }
+.progress { height: 6px; margin: 0 18px 14px; overflow: hidden; border-radius: 999px; background: var(--panel-raised); }
+.progress > span { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--accent-2), var(--accent)); transition: width .2s ease-out; }
+.release-notes { margin: 0 18px 12px; padding: 12px 14px; border: 1px solid var(--line-soft); border-radius: var(--radius-sm); background: var(--panel-deep); }
+.release-notes .eyebrow { margin-bottom: 6px; }
+.release-notes pre { max-height: 160px; margin: 0; overflow: auto; color: var(--text-2); font: var(--fs-sm)/1.55 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif; white-space: pre-wrap; }
+
 /* ---------- Toasts and dialogs ---------- */
 .toast-stack { position: fixed; z-index: 90; right: 20px; bottom: 40px; display: grid; gap: 8px; justify-items: end; pointer-events: none; }
 .toast { display: flex; align-items: center; gap: 10px; max-width: min(440px, calc(100vw - 40px)); padding: 11px 12px 11px 14px; border: 1px solid var(--line-strong); border-radius: var(--radius); background: #142d39; box-shadow: var(--shadow-pop); color: var(--text); font-size: var(--fs-sm); pointer-events: auto; animation: toast-in .18s ease-out; }

@@ -3,6 +3,77 @@ import logo from "../assets/softconnect-icon.svg";
 import { Icon } from "../components/Icon.jsx";
 import { PanelHeading, Status, TaskButton } from "../components/ui.jsx";
 
+const timeFormat = new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit" });
+
+function updateSummary(status) {
+  const latest = status.latestVersion;
+  switch (status.state) {
+    case "checking": return "Checking for updates…";
+    case "up-to-date": return `SoftConnect ${status.currentVersion} is the latest version.`;
+    case "available": return `Version ${latest} is available.`;
+    case "downloading": return `Downloading version ${latest}… ${Math.round((status.progress || 0) * 100)}%`;
+    case "verifying": return `Verifying version ${latest}…`;
+    case "ready": return `Version ${latest} is ready. It installs when you quit SoftConnect.`;
+    case "installed": return "Installing and restarting…";
+    case "error": return `Couldn't update: ${status.error}`;
+    default: return status.autoUpdate ? "SoftConnect checks for updates in the background." : "Automatic updates are off.";
+  }
+}
+
+function UpdatesPanel({ status, actions }) {
+  if (!status) {
+    return (
+      <section className="panel">
+        <PanelHeading eyebrow="Software update" title="Updates"/>
+        <div className="panel-note"><Icon name="info" size={15}/><span>Updates are managed by the macOS app.</span></div>
+      </section>
+    );
+  }
+  const busy = ["checking", "downloading", "verifying", "installed"].includes(status.state);
+  const showProgress = status.state === "downloading" || status.state === "verifying";
+  return (
+    <section className="panel updates-panel">
+      <PanelHeading eyebrow="Software update" title="Updates"><span className="version-pill">v{status.currentVersion}</span></PanelHeading>
+      <div className={`update-status update-${status.state}`} role="status">
+        <span className="row-icon"><Icon name={status.state === "error" ? "warning" : status.state === "ready" ? "checkCircle" : "refresh"} size={17}
+          className={status.state === "checking" ? "spinning" : undefined}/></span>
+        <div>
+          <strong>{updateSummary(status)}</strong>
+          {status.checkedAt && status.state !== "checking" && <small>Last checked {timeFormat.format(status.checkedAt)}</small>}
+          {!status.canInstall && status.installBlockedReason && <small>{status.installBlockedReason}</small>}
+        </div>
+      </div>
+      {showProgress && (
+        <div className="progress" role="progressbar" aria-label="Update download" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round((status.progress || 0) * 100)}>
+          <span style={{ width: `${Math.round((status.progress || 0) * 100)}%` }}/>
+        </div>
+      )}
+      {status.notes && (status.state === "available" || status.state === "ready" || showProgress) && (
+        <div className="release-notes"><span className="eyebrow">What's new in {status.latestVersion}</span><pre>{status.notes}</pre></div>
+      )}
+      <div className="settings-actions">
+        {status.state === "ready"
+          ? <button className="button primary" onClick={actions.install}><Icon name="refresh" size={15}/>Restart to update</button>
+          : status.state === "available" && status.canInstall
+            ? <button className="button primary" onClick={actions.download}><Icon name="arrow" size={15}/>Download and install</button>
+            : null}
+        {status.state === "available" && !status.canInstall && status.releaseUrl && (
+          <button className="button quiet" onClick={actions.openReleasePage}><Icon name="external" size={15}/>Download from GitHub</button>
+        )}
+        <TaskButton busy={status.state === "checking"} busyLabel="Checking…" icon="refresh" onClick={actions.check} disabled={busy}>Check for updates</TaskButton>
+        {status.releaseUrl && status.state !== "available" && (
+          <button className="link-button" onClick={actions.openReleasePage}>Release notes<Icon name="external" size={13}/></button>
+        )}
+      </div>
+      <label className="setting-row">
+        <span className="row-icon"><Icon name="bolt" size={17}/></span>
+        <span className="setting-copy"><strong>Update automatically</strong><small>Download new versions in the background and install them when you quit. Every update is signature-checked before it is installed.</small></span>
+        <input type="checkbox" role="switch" checked={status.autoUpdate} onChange={(event) => actions.setAutoUpdate(event.target.checked)}/>
+      </label>
+    </section>
+  );
+}
+
 const SHORTCUTS = [
   [["⌘", "K"], "Search devices (also ⌘F)"],
   [["⌘", "R"], "Refresh the device list"],
@@ -12,7 +83,7 @@ const SHORTCUTS = [
   [["Esc"], "Close a dialog or clear the search"],
 ];
 
-export const Settings = memo(function Settings({ mode, preview, autoRefresh, nativeStatus, pending, version, hasBridge, onAutoRefresh, onPreview, onOpenClient, onGetClient, onOpenServer, onDiagnostics, onRefresh }) {
+export const Settings = memo(function Settings({ mode, preview, autoRefresh, nativeStatus, pending, version, hasBridge, update, updateActions, onAutoRefresh, onPreview, onOpenClient, onGetClient, onOpenServer, onDiagnostics, onRefresh }) {
   const live = mode === "live";
   const checking = mode === "checking";
   const clientPath = nativeStatus.paths?.client;
@@ -67,14 +138,17 @@ export const Settings = memo(function Settings({ mode, preview, autoRefresh, nat
         </section>
       </div>
 
-      <section className="panel shortcuts-panel">
+      <div className="two-column settings-row">
+        <UpdatesPanel status={update} actions={updateActions}/>
+        <section className="panel shortcuts-panel">
         <PanelHeading eyebrow="Keyboard" title="Shortcuts"/>
         <dl className="shortcut-list">
           {SHORTCUTS.map(([keys, label]) => (
             <div key={label}><dt>{keys.map((key) => <kbd key={key}>{key}</kbd>)}</dt><dd>{label}</dd></div>
           ))}
         </dl>
-      </section>
+        </section>
+      </div>
 
       <section className="panel about-panel">
         <img src={logo} alt=""/>

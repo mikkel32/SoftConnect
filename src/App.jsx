@@ -10,6 +10,7 @@ import { Overview } from "./views/Overview.jsx";
 import { Settings } from "./views/Settings.jsx";
 import { fieldError, SETTINGS_VIEW, VIEW_IDS, VIEWS } from "./workspace/model.js";
 import { notify } from "./workspace/toasts.js";
+import { useUpdates } from "./workspace/useUpdates.js";
 import { useWorkspace } from "./workspace/useWorkspace.js";
 
 const TITLES = Object.fromEntries([...VIEWS, SETTINGS_VIEW].map((item) => [item.id, item.label]));
@@ -19,6 +20,7 @@ const validateAddress = (value) => fieldError(value, { allowSpaces: false });
 
 export function App() {
   const { state, actions } = useWorkspace();
+  const updates = useUpdates();
   const [view, setView] = useState("overview");
   const [selection, setSelection] = useState(null);
   const [search, setSearch] = useState("");
@@ -93,6 +95,7 @@ export function App() {
   }, [actions, focusSearch, navigate]);
 
   // A result that arrives while a form is open waits until the form closes, so typed text is never lost.
+  const showUpdates = useCallback(() => navigate("settings"), [navigate]);
   const closeDialog = useCallback(() => setDialog((current) => current?.queued || null), []);
   const openAddServer = useCallback(() => setDialog({ kind: "add-server" }), []);
   const openRename = useCallback((device) => setDialog({ kind: "rename", target: device.address, value: device.name }), []);
@@ -114,7 +117,8 @@ export function App() {
       <Sidebar view={view} mode={mode} connectedCount={state.groups.connected.length}
         version={state.nativeStatus.appVersion || appVersion} onNavigate={navigate}/>
       <div className="main-shell">
-        <Topbar title={TITLES[view]} mode={mode} syncing={state.syncing} onRefresh={actions.refresh}/>
+        <Topbar title={TITLES[view]} mode={mode} syncing={state.syncing} update={updates.status} onRefresh={actions.refresh}
+          onInstallUpdate={updates.actions.install} onShowUpdates={showUpdates}/>
         <main className="main-content" id="main-content" ref={mainRef}>
           <div className="page">
             <ConnectionBanner mode={mode} reason={state.clientReason} clientInstalled={Boolean(state.nativeStatus.paths?.client)}
@@ -144,6 +148,7 @@ export function App() {
             {view === "settings" && (
               <Settings mode={mode} preview={state.preview} autoRefresh={state.autoRefresh} nativeStatus={state.nativeStatus}
                 pending={pending} version={state.nativeStatus.appVersion || appVersion} hasBridge={state.hasBridge}
+                update={updates.status} updateActions={updates.actions}
                 onAutoRefresh={actions.setAutoRefresh} onPreview={togglePreview} onOpenClient={actions.openClient}
                 onGetClient={actions.openClientDownload} onOpenServer={actions.openServer}
                 onDiagnostics={() => showInfo("Native client diagnostics", actions.readDiagnostics)} onRefresh={actions.refresh}/>

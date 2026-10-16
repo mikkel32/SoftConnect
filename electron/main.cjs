@@ -3,7 +3,9 @@
 const { app, BrowserWindow, ipcMain, Menu, protocol, screen, session, shell } = require("electron");
 const { readFile } = require("node:fs/promises");
 const { join, resolve, sep } = require("node:path");
-const { createNativeService } = require("./native.cjs");
+const { createNativeService, run } = require("./native.cjs");
+const { UPDATE_PUBLIC_KEY } = require("./update-key.cjs");
+const { createUpdater, filePreferences, macTools } = require("./updater.cjs");
 
 const APP_URL = "softconnect://app/index.html";
 const CLIENT_DOWNLOAD_URL = "https://www.virtualhere.com/usb_client_software";
@@ -12,6 +14,7 @@ const DIST = resolve(__dirname, "../dist");
 const BACKGROUND = "#08121b";
 const service = createNativeService();
 let mainWindow = null;
+let updater = null;
 
 protocol.registerSchemesAsPrivileged([{
   scheme: "softconnect",
@@ -70,6 +73,37 @@ function registerApi() {
   handle("open-server", () => service.openApp("server"));
   handle("open-client", () => service.openApp("client"));
   handle("client-download", () => shell.openExternal(CLIENT_DOWNLOAD_URL));
+  handle("update-status", () => updater.getStatus());
+  handle("update-check", () => updater.check());
+  handle("update-download", () => updater.download());
+  handle("update-auto", (enabled) => updater.setAutoUpdate(enabled === true));
+  handle("update-install", () => {
+    if (!updater.installNow()) return updater.getStatus();
+    // The new bundle now sits at the old path, so relaunching starts the new version.
+    app.relaunch();
+    app.exit(0);
+    return updater.getStatus();
+  });
+  handle("update-release-page", () => {
+    const url = updater.releasePage();
+    return url ? shell.openExternal(url) : undefined;
+  });
+}
+
+function createAppUpdater() {
+  // A separate in-memory session: the default session blocks all network requests for the renderer.
+  const updateSession = session.fromPartition("softconnect-updates");
+  return createUpdater({
+    currentVersion: app.getVersion(),
+    publicKey: UPDATE_PUBLIC_KEY,
+    fetch: (url, init) => updateSession.fetch(url, init),
+    tools: macTools(run),
+    tempDir: app.getPath("temp"),
+    packaged: app.isPackaged,
+    execPath: process.execPath,
+    preferences: filePreferences(join(app.getPath("userData"), "updates.json")),
+    onStatus: (status) => sendToRenderer({ type: "update", status }),
+  });
 }
 
 function buildMenu() {
@@ -77,6 +111,7 @@ function buildMenu() {
   return Menu.buildFromTemplate([
     { label: "SoftConnect", submenu: [
       { role: "about" },
+      { label: "Check for Updates…", click: () => { updater?.check(); sendToRenderer({ type: "navigate", view: "settings" }); } },
       { type: "separator" },
       { label: "Settings…", accelerator: "CmdOrCtrl+,", click: navigate("settings") },
       { type: "separator" },
@@ -166,10 +201,14 @@ app.whenReady().then(() => {
   );
   session.defaultSession.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
   session.defaultSession.setPermissionCheckHandler(() => false);
+  updater = createAppUpdater();
   registerApi();
   Menu.setApplicationMenu(buildMenu());
+  updater.start().catch((error) => console.error("SoftConnect could not start its updater:", error));
   createWindow();
   app.on("activate", () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 });
 
 app.on("window-all-closed", () => { if (process.platform !== "darwin") app.quit(); });
+// A downloaded update replaces the app as it quits, the same moment Sparkle and Squirrel install.
+app.on("will-quit", () => { updater?.installOnQuit(); });

@@ -386,4 +386,4 @@ function createNativeService({ clientPaths = CLIENT_PATHS, serverPaths = SERVER_
   return { findPaths, getState, getDetailedState, getStatus, getSnapshot, sendCommand, openApp, readServerLog };
 }
 
-module.exports = { createNativeService, parseClientList, parseClientStateXml, parseServerProcesses };
+module.exports = { createNativeService, parseClientList, parseClientStateXml, parseServerProcesses, run };
