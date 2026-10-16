@@ -3,9 +3,7 @@
 const { contextBridge, ipcRenderer } = require("electron");
 
 contextBridge.exposeInMainWorld("softconnect", Object.freeze({
-  getStatus: () => ipcRenderer.invoke("softconnect:status"),
-  getState: () => ipcRenderer.invoke("softconnect:state"),
-  listDevices: () => ipcRenderer.invoke("softconnect:state"),
+  getSnapshot: (options) => ipcRenderer.invoke("softconnect:snapshot", { fresh: options?.fresh === true }),
   getDetailedState: () => ipcRenderer.invoke("softconnect:detailed-state"),
   sendCommand: (command) => ipcRenderer.invoke("softconnect:command", command),
   readServerLog: () => ipcRenderer.invoke("softconnect:server-log"),

@@ -8,6 +8,8 @@ const { createNativeService } = require("./native.cjs");
 const APP_URL = "softconnect://app/index.html";
 const CLIENT_DOWNLOAD_URL = "https://www.virtualhere.com/usb_client_software";
 const DIST = resolve(__dirname, "../dist");
+// Matches the renderer's --bg token so the window does not flash a different shade while loading.
+const BACKGROUND = "#08121b";
 const service = createNativeService();
 let mainWindow = null;
 
@@ -42,31 +44,58 @@ function isMainFrame(event) {
   }
 }
 
-function handle(channel, operation, shouldNotify = () => false) {
+function handle(channel, operation) {
   ipcMain.handle(`softconnect:${channel}`, async (event, ...args) => {
     if (!isMainFrame(event)) throw new Error("Request was not sent by SoftConnect");
-    const result = await operation(...args);
-    if (shouldNotify(args, result)) {
-      mainWindow?.webContents.send("softconnect:event", { type: "state-changed" });
-    }
-    return result;
+    return operation(...args);
   });
 }
 
+// The renderer refreshes after its own commands, so the main process only pushes menu actions.
+function sendToRenderer(event) {
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("softconnect:event", event);
+}
+
 function registerApi() {
-  handle("status", async () => ({
-    ...(await service.getStatus()),
-    appVersion: app.getVersion(),
-    platform: process.platform,
-  }));
-  handle("state", () => service.getState());
+  handle("snapshot", async (options) => {
+    const snapshot = await service.getSnapshot({ fresh: options?.fresh === true });
+    return {
+      ...snapshot,
+      status: snapshot.status && { ...snapshot.status, appVersion: app.getVersion(), platform: process.platform },
+    };
+  });
   handle("detailed-state", () => service.getDetailedState());
-  handle("command", (command) => service.sendCommand(command), ([command], result) =>
-    result?.available === true && !["device-info", "server-info"].includes(command?.action));
+  handle("command", (command) => service.sendCommand(command));
   handle("server-log", () => service.readServerLog());
-  handle("open-server", () => service.openApp("server"), (_args, result) => result?.opened === true);
-  handle("open-client", () => service.openApp("client"), (_args, result) => result?.opened === true);
+  handle("open-server", () => service.openApp("server"));
+  handle("open-client", () => service.openApp("client"));
   handle("client-download", () => shell.openExternal(CLIENT_DOWNLOAD_URL));
+}
+
+function buildMenu() {
+  const navigate = (view) => () => sendToRenderer({ type: "navigate", view });
+  return Menu.buildFromTemplate([
+    { label: "SoftConnect", submenu: [
+      { role: "about" },
+      { type: "separator" },
+      { label: "Settings…", accelerator: "CmdOrCtrl+,", click: navigate("settings") },
+      { type: "separator" },
+      { role: "hide" }, { role: "hideOthers" }, { role: "unhide" },
+      { type: "separator" },
+      { role: "quit" },
+    ] },
+    { label: "Edit", submenu: [{ role: "undo" }, { role: "redo" }, { type: "separator" }, { role: "cut" }, { role: "copy" }, { role: "paste" }, { role: "selectAll" }] },
+    { label: "View", submenu: [
+      { label: "Refresh Devices", accelerator: "CmdOrCtrl+R", click: () => sendToRenderer({ type: "refresh" }) },
+      { label: "Find Device", accelerator: "CmdOrCtrl+F", click: () => sendToRenderer({ type: "find" }) },
+      { type: "separator" },
+      { label: "Overview", accelerator: "CmdOrCtrl+1", click: navigate("overview") },
+      { label: "Devices", accelerator: "CmdOrCtrl+2", click: navigate("devices") },
+      { label: "Connections", accelerator: "CmdOrCtrl+3", click: navigate("connections") },
+      { label: "Activity", accelerator: "CmdOrCtrl+4", click: navigate("activity") },
+    ] },
+    { label: "Window", submenu: [{ role: "minimize" }, { role: "zoom" }, { type: "separator" }, { role: "close" }] },
+  ]);
 }
 
 function registerAssetProtocol() {
@@ -100,10 +129,10 @@ function createWindow() {
     title: "SoftConnect",
     width,
     height,
-    minWidth: Math.min(960, width),
-    minHeight: Math.min(640, height),
+    minWidth: Math.min(760, width),
+    minHeight: Math.min(560, height),
     show: false,
-    backgroundColor: "#0b101b",
+    backgroundColor: BACKGROUND,
     titleBarStyle: process.platform === "darwin" ? "hiddenInset" : "default",
     webPreferences: {
       preload: join(__dirname, "preload.cjs"),
@@ -113,6 +142,7 @@ function createWindow() {
       sandbox: true,
       webviewTag: false,
       allowRunningInsecureContent: false,
+      spellcheck: false,
       devTools: !app.isPackaged,
     },
   });
@@ -137,11 +167,7 @@ app.whenReady().then(() => {
   session.defaultSession.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
   session.defaultSession.setPermissionCheckHandler(() => false);
   registerApi();
-  Menu.setApplicationMenu(Menu.buildFromTemplate([
-    { label: "SoftConnect", submenu: [{ role: "about" }, { type: "separator" }, { role: "quit" }] },
-    { label: "Edit", submenu: [{ role: "undo" }, { role: "redo" }, { type: "separator" }, { role: "cut" }, { role: "copy" }, { role: "paste" }, { role: "selectAll" }] },
-    { label: "Window", submenu: [{ role: "minimize" }, { role: "close" }] },
-  ]));
+  Menu.setApplicationMenu(buildMenu());
   createWindow();
   app.on("activate", () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 });

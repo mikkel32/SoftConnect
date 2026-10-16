@@ -1,7 +1,7 @@
 "use strict";
 
 const assert = require("node:assert/strict");
-const { chmod, mkdtemp, readFile, rm, symlink, writeFile } = require("node:fs/promises");
+const { chmod, mkdtemp, readFile, rm, symlink, unlink, writeFile } = require("node:fs/promises");
 const { tmpdir } = require("node:os");
 const { join } = require("node:path");
 const { test } = require("node:test");
@@ -46,6 +46,18 @@ Studio Hub (studio:7575)
   assert.equal(devices[0].inUse, true);
   assert.equal(devices[0].localUse, false);
   assert.equal(devices[1].localUse, true);
+});
+
+test("LIST parser reports who holds a device in use elsewhere", () => {
+  const list = `VirtualHere Client IPC, below are the available devices:
+Studio Hub (studio:7575)
+  --> Audio DAC (MK II) (studio.11) (In-use by:Jane (Jane) at 192.168.1.15)
+  --> Serial Cable (studio.12) In-use by: another client
+  --> Security Key (studio.13) (In-use by you)
+  --> Webcam (studio.14)
+`;
+  const owners = parseClientList(list).servers[0].devices.map((device) => device.owner);
+  assert.deepEqual(owners, ["Jane (Jane) at 192.168.1.15", "another client", null, null]);
 });
 
 test("server process detection requires the installed executable, not a matching argument", () => {
@@ -132,6 +144,37 @@ setTimeout(() => {
       { phase: "start", command: "LIST" },
       { phase: "end", command: "LIST" },
     ]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("snapshot returns status and state in one call and rediscovers a removed client", async () => {
+  const root = await mkdtemp(join(tmpdir(), "softconnect-snapshot-fixture-"));
+  const client = join(root, "mock-client.cjs");
+  try {
+    await writeFile(client, `#!/usr/bin/env node\nprocess.stdout.write(${JSON.stringify(LIST)});\n`);
+    await chmod(client, 0o700);
+    const service = createNativeService({ clientPaths: [client], serverPaths: [] });
+    const snapshot = await service.getSnapshot();
+    assert.deepEqual(snapshot.status, { paths: { client, serverApp: null }, server: { installed: false, running: false } });
+    assert.equal(snapshot.state.available, true);
+    assert.equal(snapshot.state.servers.length, 2);
+
+    // The cached path now points at a missing file: the failed spawn triggers discovery in the same read.
+    await unlink(client);
+    await new Promise((resolve) => setTimeout(resolve, 800)); // outlive the 750 ms read cache
+    const removed = await service.getState();
+    assert.equal(removed.available, false);
+    assert.match(removed.reason, /Install and launch/);
+
+    // A fresh snapshot skips the read cache that would otherwise answer within 750 ms.
+    await writeFile(client, `#!/usr/bin/env node\nprocess.stdout.write(${JSON.stringify(LIST)});\n`);
+    await chmod(client, 0o700);
+    assert.equal((await service.getSnapshot()).state.available, true);
+    await unlink(client);
+    assert.equal((await service.getSnapshot()).state.available, true, "cached read within 750 ms");
+    assert.match((await service.getSnapshot({ fresh: true })).state.reason, /Install and launch/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
