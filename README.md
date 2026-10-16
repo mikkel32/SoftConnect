@@ -58,7 +58,11 @@ Updates install only into a writable copy in a normal folder such as Application
 npm run update-key
 ```
 
-It creates a key pair, stores the private key as the `SOFTCONNECT_UPDATE_KEY` Actions secret (it is never printed or written to disk), and writes the public key to `electron/update-key.cjs`. Commit and push that file. Until then, the Release workflow skips publishing with a notice, and builds cannot install updates. Generating a new key later cuts installed copies off from automatic updates, because they only trust the key they shipped with; people would install the first release signed with the new key by hand.
+It creates a key pair, stores the private key as the `SOFTCONNECT_UPDATE_KEY` Actions secret (it is never printed), and writes the public key to `electron/update-key.cjs`. Commit and push that file. Until then, the Release workflow skips publishing with a notice, and builds cannot install updates.
+
+Add `-- --backup ~/softconnect-update-key.pem` to also save the private key, then move that file into a password manager. Installed copies trust only the key they shipped with, so if the secret is ever lost, restore it from the backup (`gh secret set SOFTCONNECT_UPDATE_KEY < backup.pem`). Replacing the key (`npm run update-key -- --rotate`) cuts installed copies off from automatic updates until people install the first release signed with the new key by hand; the script refuses to do that without `--rotate`.
+
+The workflow keeps the key away from build code: the macOS job that runs npm, tests and packaging never receives it; a separate job without npm signs the manifest and is the only one allowed to publish. Releases are cut only from the newest commit on `main`, and the packaged app is checked with the same bundle, version and `codesign` checks the installed app runs before anything is published.
 
 ## Architecture and trust boundary
 

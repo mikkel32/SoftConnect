@@ -16,6 +16,15 @@ const service = createNativeService();
 let mainWindow = null;
 let updater = null;
 
+// One running copy: two would share the update staging folder and the client's IPC endpoint.
+const primaryInstance = app.requestSingleInstanceLock();
+if (!primaryInstance) app.quit();
+app.on("second-instance", () => {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.focus();
+});
+
 protocol.registerSchemesAsPrivileged([{
   scheme: "softconnect",
   privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true },
@@ -75,7 +84,8 @@ function registerApi() {
   handle("client-download", () => shell.openExternal(CLIENT_DOWNLOAD_URL));
   handle("update-status", () => updater.getStatus());
   handle("update-check", () => updater.check());
-  handle("update-download", () => updater.download());
+  // A download the user asks for survives turning automatic updates off.
+  handle("update-download", () => updater.download({ explicit: true }));
   handle("update-auto", (enabled) => updater.setAutoUpdate(enabled === true));
   handle("update-install", () => {
     if (!updater.installNow()) return updater.getStatus();
@@ -194,6 +204,7 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
+  if (!primaryInstance) return;
   registerAssetProtocol();
   session.defaultSession.webRequest.onBeforeRequest(
     { urls: ["http://*/*", "https://*/*", "file://*/*"] },

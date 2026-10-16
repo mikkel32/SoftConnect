@@ -5,24 +5,29 @@
 //   1. read this repository's latest GitHub release,
 //   2. verify the release's update manifest against the Ed25519 public key shipped in the app,
 //   3. download the archive for this Mac and check its size and SHA-256 against the manifest,
-//   4. unpack it next to the installed app and check bundle id, version and code signature,
-//   5. swap the bundles with two same-volume renames when the app quits or restarts.
+//   4. unpack it into a fresh folder next to the installed app and check bundle id, version and
+//      code signature,
+//   5. when the app quits or restarts, re-check the staged bundle on disk and swap the bundles with
+//      two same-volume renames.
+// What installs on quit is always exactly the release the interface shows as ready.
 
+const { spawnSync } = require("node:child_process");
 const { createHash, createPublicKey, verify: verifySignature } = require("node:crypto");
 const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const { dirname, join } = require("node:path");
 
-const REPOSITORY = "mikkel32/SoftConnect";
-const LATEST_RELEASE_URL = `https://api.github.com/repos/${REPOSITORY}/releases/latest`;
-const RELEASE_PAGE_PREFIX = `https://github.com/${REPOSITORY}/releases/`;
-const DOWNLOAD_PREFIX = `${RELEASE_PAGE_PREFIX}download/`;
+const RELEASES_PATH = "/mikkel32/softconnect/releases/";
+const LATEST_RELEASE_URL = "https://api.github.com/repos/mikkel32/SoftConnect/releases/latest";
+const DOWNLOAD_PREFIX = "https://github.com/mikkel32/SoftConnect/releases/download/";
 const MANIFEST_NAME = "softconnect-update.json";
 const SIGNATURE_NAME = `${MANIFEST_NAME}.sig`;
 const BUNDLE_ID = "app.softconnect.desktop";
 const BUNDLE_NAME = "SoftConnect.app";
+const EXECUTABLE = "Contents/MacOS/SoftConnect";
 // Staged beside the installed app so the final swap is a rename on the same volume.
 const STAGING_NAME = ".SoftConnect-update";
+const BACKUP_NAME = "SoftConnect-previous.app";
 const ARCHIVE_NAME = /^SoftConnect-(\d+\.\d+\.\d+)-mac-(arm64|x64)\.zip$/;
 const MAX_METADATA_BYTES = 1024 * 1024;
 const MAX_SIGNATURE_BYTES = 1024;
@@ -31,6 +36,8 @@ const MAX_NOTES_LENGTH = 4000;
 const FIRST_CHECK_DELAY_MS = 15000;
 const CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000;
 const PROGRESS_INTERVAL_MS = 200;
+// A metadata request must finish within `metadata`; a download fails if no bytes arrive for `downloadIdle`.
+const TIMEOUTS = { metadata: 30000, downloadIdle: 60000 };
 const NO_KEY_REASON = "This build has no update signing key, so it cannot verify or install updates.";
 
 function parseVersion(value) {
@@ -46,6 +53,18 @@ function isNewer(candidate, current) {
     if (next[index] !== installed[index]) return next[index] > installed[index];
   }
   return false;
+}
+
+// Only https://github.com/mikkel32/SoftConnect/releases/... (download URLs when `download` is set).
+function isReleaseUrl(value, download = false) {
+  try {
+    const url = new URL(value);
+    const prefix = download ? `${RELEASES_PATH}download/` : RELEASES_PATH;
+    return url.protocol === "https:" && url.hostname === "github.com" && !url.port && !url.username && !url.password
+      && url.pathname.toLowerCase().startsWith(prefix);
+  } catch {
+    return false;
+  }
 }
 
 function validateManifest(manifest) {
@@ -96,8 +115,30 @@ function installTarget({ platform, packaged, execPath }) {
 
 function friendlyError(error) {
   const message = error?.message || String(error);
+  if (error?.name === "TimeoutError") return "GitHub did not respond in time. SoftConnect will try again later.";
   if (/ERR_INTERNET_DISCONNECTED|ERR_NAME_NOT_RESOLVED|ENOTFOUND|EAI_AGAIN/i.test(message)) return "You appear to be offline.";
   return message;
+}
+
+// Rejects as soon as `signal` aborts, even if the underlying operation ignores the signal.
+function abortable(promise, signal) {
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => { signal.removeEventListener("abort", onAbort); resolve(value); },
+      (error) => { signal.removeEventListener("abort", onAbort); reject(error); },
+    );
+  });
+}
+
+// Like AbortSignal.timeout, but with an ordinary timer: AbortSignal.timeout's timer is unref'd, so a
+// stalled request could be left pending forever once nothing else keeps the event loop alive.
+function deadline(ms) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new DOMException("The operation timed out.", "TimeoutError")), ms);
+  return { signal: controller.signal, clear: () => clearTimeout(timer) };
 }
 
 function memoryPreferences(initial = {}) {
@@ -126,7 +167,7 @@ function filePreferences(path) {
   };
 }
 
-// macOS tools used for staging; tests substitute these.
+// macOS tools used for staging and installing; tests substitute these.
 function macTools(run) {
   async function succeed(executable, args, timeoutMs, failure) {
     const result = await run(executable, args, timeoutMs);
@@ -137,6 +178,11 @@ function macTools(run) {
     extract: (archive, directory) => succeed("/usr/bin/ditto", ["-x", "-k", archive, directory], 180000, "Couldn't unpack the update"),
     bundleInfo: async (app) => JSON.parse((await succeed("/usr/bin/plutil", ["-convert", "json", "-o", "-", join(app, "Contents/Info.plist")], 10000, "Couldn't read the update's Info.plist")).stdout),
     verifySignature: (app) => succeed("/usr/bin/codesign", ["--verify", "--deep", "--strict", app], 120000, "The update's code signature is invalid"),
+    // Synchronous so the last-moment check can run inside will-quit.
+    versionSync: (app) => {
+      const result = spawnSync("/usr/bin/plutil", ["-extract", "CFBundleShortVersionString", "raw", "-o", "-", join(app, "Contents/Info.plist")], { encoding: "utf8", timeout: 5000 });
+      return result.status === 0 ? result.stdout.trim() : null;
+    },
   };
 }
 
@@ -154,16 +200,17 @@ function createUpdater({
   onStatus = () => {},
   now = Date.now,
   autoCheck = packaged && Boolean(publicKey),
+  timeouts = TIMEOUTS,
 }) {
   const target = installTarget({ platform, packaged, execPath });
   // Reasons that hold for the whole run; writability is re-checked before every update check.
   const fixedReason = target.reason || (publicKey ? null : NO_KEY_REASON);
   let prefs = preferences.load();
   let blockedReason = fixedReason;
-  let release = null;
-  let staged = null;
+  let release = null; // the newer release this Mac can install: { version, archive, archiveUrl }
+  let staged = null; // a verified bundle waiting to install: { directory, app, version, explicit }
   let checking = null;
-  let downloading = null;
+  let downloading = null; // { promise, controller, explicit, cancelled }
   let timers = [];
   let status = {
     state: "idle",
@@ -177,8 +224,11 @@ function createUpdater({
     progress: 0,
     checkedAt: null,
     error: null,
+    notice: null,
     updatedFrom: null,
   };
+
+  const stagingRoot = () => join(dirname(target.bundle), STAGING_NAME);
 
   function getStatus() {
     return { ...status };
@@ -194,25 +244,43 @@ function createUpdater({
     preferences.save(prefs);
   }
 
+  function forgetFailure(version) {
+    if (prefs.failedVersion !== version) return;
+    const { failedVersion: _cleared, ...rest } = prefs;
+    savePrefs(rest);
+  }
+
+  // Drops the staged bundle at once; its folder is removed in the background.
+  function discardStaged() {
+    const previous = staged;
+    staged = null;
+    return previous ? fsp.rm(previous.directory, { recursive: true, force: true }).catch(() => {}) : Promise.resolve();
+  }
+
   const headers = (accept) => ({ Accept: accept, "Cache-Control": "no-cache", "User-Agent": `SoftConnect/${currentVersion}` });
 
   async function fetchBytes(url, accept, limit) {
-    const response = await fetchImpl(url, { headers: headers(accept) });
-    if (!response.ok) {
-      if (response.status === 404) throw new Error("No stable release has been published yet.");
-      if (response.status === 403 || response.status === 429) throw new Error("GitHub is rate limiting update checks. SoftConnect will try again later.");
-      throw new Error(`GitHub answered HTTP ${response.status}.`);
+    const { signal, clear } = deadline(timeouts.metadata);
+    try {
+      const response = await abortable(fetchImpl(url, { headers: headers(accept), signal }), signal);
+      if (!response.ok) {
+        if (response.status === 404) throw new Error("No stable release has been published yet.");
+        const rateLimited = response.status === 429 || (response.status === 403 && response.headers.get("x-ratelimit-remaining") === "0");
+        if (rateLimited) throw new Error("GitHub is rate limiting update checks. SoftConnect will try again later.");
+        throw new Error(`GitHub answered HTTP ${response.status}.`);
+      }
+      if (Number(response.headers.get("content-length") || 0) > limit) throw new Error("The update metadata is unexpectedly large.");
+      const bytes = Buffer.from(await abortable(response.arrayBuffer(), signal));
+      if (bytes.length > limit) throw new Error("The update metadata is unexpectedly large.");
+      return bytes;
+    } finally {
+      clear();
     }
-    if (Number(response.headers.get("content-length") || 0) > limit) throw new Error("The update metadata is unexpectedly large.");
-    const bytes = Buffer.from(await response.arrayBuffer());
-    if (bytes.length > limit) throw new Error("The update metadata is unexpectedly large.");
-    return bytes;
   }
 
   function assetUrl(releaseJson, name) {
     const asset = Array.isArray(releaseJson.assets) ? releaseJson.assets.find((candidate) => candidate?.name === name) : null;
-    const url = asset?.browser_download_url;
-    return typeof url === "string" && url.toLowerCase().startsWith(DOWNLOAD_PREFIX.toLowerCase()) ? url : null;
+    return isReleaseUrl(asset?.browser_download_url, true) ? asset.browser_download_url : null;
   }
 
   async function refreshWritable() {
@@ -228,24 +296,27 @@ function createUpdater({
   }
 
   async function runCheck() {
-    set({ state: "checking", error: null });
+    // A staged update stays on screen while a background check runs.
+    if (!staged) set({ state: "checking", error: null });
     try {
       await refreshWritable();
       const releaseJson = JSON.parse((await fetchBytes(LATEST_RELEASE_URL, "application/vnd.github+json", MAX_METADATA_BYTES)).toString("utf8"));
       const version = String(releaseJson.tag_name || "").replace(/^v/, "");
       if (!parseVersion(version)) throw new Error("The latest release has no valid version tag.");
-      const releaseUrl = typeof releaseJson.html_url === "string" && releaseJson.html_url.toLowerCase().startsWith(RELEASE_PAGE_PREFIX.toLowerCase())
-        ? releaseJson.html_url
-        : null;
+      const releaseUrl = isReleaseUrl(releaseJson.html_url) ? releaseJson.html_url : null;
       if (!isNewer(version, currentVersion)) {
+        // Covers a withdrawn release too: a staged bundle the latest release no longer offers never installs.
         release = null;
-        set({ state: "up-to-date", latestVersion: version, notes: "", releaseUrl, checkedAt: now() });
+        await discardStaged();
+        set({ state: "up-to-date", latestVersion: version, notes: "", releaseUrl, checkedAt: now(), notice: null, error: null });
         return getStatus();
       }
       if (staged?.version === version) {
         set({ state: "ready", latestVersion: version, releaseUrl, checkedAt: now() });
         return getStatus();
       }
+      // A newer release replaces whatever was staged, so quitting never installs a version the UI no longer shows.
+      await discardStaged();
       if (!publicKey) {
         release = null;
         set({ state: "available", latestVersion: version, notes: "", releaseUrl, checkedAt: now(), canInstall: false, installBlockedReason: NO_KEY_REASON });
@@ -272,10 +343,16 @@ function createUpdater({
         releaseUrl,
         checkedAt: now(),
         progress: 0,
+        error: null,
         canInstall: Boolean(release) && !blockedReason,
         installBlockedReason: release ? blockedReason : `Version ${version} has no build for this Mac (${arch}).`,
+        notice: prefs.failedVersion === version ? `Version ${version} failed verification before, so it is not downloaded automatically.` : null,
       });
     } catch (error) {
+      if (staged) {
+        set({ state: "ready", checkedAt: now() });
+        return getStatus();
+      }
       set({ state: "error", error: friendlyError(error), checkedAt: now() });
     }
     return getStatus();
@@ -285,86 +362,137 @@ function createUpdater({
     if (downloading) return Promise.resolve(getStatus());
     if (!checking) {
       checking = runCheck().then((result) => {
-        if (result.state === "available" && status.autoUpdate && status.canInstall) download();
+        if (result.state === "available" && status.autoUpdate && status.canInstall && prefs.failedVersion !== result.latestVersion) download();
         return getStatus();
       }).finally(() => { checking = null; });
     }
     return checking;
   }
 
-  async function downloadArchive({ archive, archiveUrl }, destination) {
-    const response = await fetchImpl(archiveUrl, { headers: headers("application/octet-stream") });
-    if (!response.ok || !response.body) throw new Error(`The download failed (HTTP ${response.status}).`);
+  async function downloadArchive({ archive, archiveUrl }, destination, cancel) {
+    const idle = new AbortController();
+    let idleTimer = null;
+    const touch = () => {
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => idle.abort(new Error("The download stalled. SoftConnect will try again later.")), timeouts.downloadIdle);
+    };
+    const signal = AbortSignal.any([cancel, idle.signal]);
     const hash = createHash("sha256");
-    const file = await fsp.open(destination, "wx", 0o600);
+    let file = null;
+    let reader = null;
     let received = 0;
     let reportedAt = 0;
+    touch();
     try {
-      for await (const chunk of response.body) {
-        received += chunk.byteLength;
+      const response = await abortable(fetchImpl(archiveUrl, { headers: headers("application/octet-stream"), signal }), signal);
+      if (!response.ok || !response.body) throw new Error(`The download failed (HTTP ${response.status}).`);
+      file = await fsp.open(destination, "wx", 0o600);
+      reader = response.body.getReader();
+      for (;;) {
+        const { done, value } = await abortable(reader.read(), signal);
+        if (done) break;
+        touch();
+        received += value.byteLength;
         if (received > archive.size) throw new Error("The update download is larger than expected.");
-        hash.update(chunk);
-        await file.write(chunk);
+        hash.update(value);
+        await file.write(value);
         if (now() - reportedAt >= PROGRESS_INTERVAL_MS) {
           reportedAt = now();
           set({ progress: received / archive.size });
         }
       }
     } finally {
-      await file.close();
+      clearTimeout(idleTimer);
+      reader?.cancel().catch(() => {});
+      await file?.close();
     }
     if (received !== archive.size || hash.digest("hex") !== archive.sha256) throw new Error("The update download failed its integrity check.");
   }
 
+  // Each attempt unpacks into its own new folder, so nothing ever writes into a bundle that is staged.
   async function stage(archivePath, version) {
-    const staging = join(dirname(target.bundle), STAGING_NAME);
-    await fsp.rm(staging, { recursive: true, force: true });
-    await fsp.mkdir(staging, { mode: 0o700 });
-    await tools.extract(archivePath, staging);
-    const app = join(staging, BUNDLE_NAME);
-    const info = await fsp.stat(app).catch(() => null);
-    if (!info?.isDirectory()) throw new Error("The update archive does not contain SoftConnect.app.");
-    const plist = await tools.bundleInfo(app);
-    if (plist?.CFBundleIdentifier !== BUNDLE_ID || plist?.CFBundleShortVersionString !== version) {
-      throw new Error("The downloaded app does not match the expected bundle or version.");
+    const root = stagingRoot();
+    await fsp.mkdir(root, { recursive: true, mode: 0o700 });
+    const directory = await fsp.mkdtemp(join(root, `${version}-`));
+    try {
+      await tools.extract(archivePath, directory);
+      const app = join(directory, BUNDLE_NAME);
+      // lstat: a symlink named SoftConnect.app is not a bundle.
+      const info = await fsp.lstat(app).catch(() => null);
+      if (!info?.isDirectory()) throw new Error("The update archive does not contain SoftConnect.app.");
+      const plist = await tools.bundleInfo(app);
+      if (plist?.CFBundleIdentifier !== BUNDLE_ID || plist?.CFBundleShortVersionString !== version) {
+        throw new Error("The downloaded app does not match the expected bundle or version.");
+      }
+      await tools.verifySignature(app);
+      return { directory, app, version };
+    } catch (error) {
+      await fsp.rm(directory, { recursive: true, force: true }).catch(() => {});
+      throw error;
     }
-    await tools.verifySignature(app);
-    return { staging, app, version };
   }
 
-  function download() {
-    if (downloading) return downloading;
-    if (!release || !status.canInstall) return Promise.resolve(getStatus());
+  function download({ explicit = false } = {}) {
+    if (downloading) {
+      if (explicit) downloading.explicit = true;
+      return downloading.promise;
+    }
+    if (!release || !status.canInstall || staged?.version === release.version) return Promise.resolve(getStatus());
     const current = release;
-    downloading = (async () => {
-      const workDir = join(tempDir, "softconnect-update");
+    const job = { controller: new AbortController(), explicit, cancelled: false, promise: null };
+    downloading = job;
+    job.promise = (async () => {
+      let workDir = null;
       try {
-        await fsp.rm(workDir, { recursive: true, force: true });
-        await fsp.mkdir(workDir, { recursive: true, mode: 0o700 });
-        set({ state: "downloading", progress: 0, error: null });
+        set({ state: "downloading", progress: 0, error: null, notice: null });
+        workDir = await fsp.mkdtemp(join(tempDir, "softconnect-update-"));
         const archivePath = join(workDir, current.archive.name);
-        await downloadArchive(current, archivePath);
+        await downloadArchive(current, archivePath, job.controller.signal);
         set({ state: "verifying", progress: 1 });
-        staged = await stage(archivePath, current.version);
-        set({ state: "ready", progress: 1 });
+        let next;
+        try {
+          next = await stage(archivePath, current.version);
+        } catch (error) {
+          // The archive matched its signed checksum, so this failure would repeat on every retry.
+          error.permanent = true;
+          throw error;
+        }
+        if (job.cancelled) {
+          await fsp.rm(next.directory, { recursive: true, force: true }).catch(() => {});
+          throw new Error("Cancelled");
+        }
+        discardStaged();
+        staged = { ...next, explicit: job.explicit };
+        forgetFailure(current.version);
+        set({ state: "ready", progress: 1, notice: null });
       } catch (error) {
-        staged = null;
-        if (target.bundle) await fsp.rm(join(dirname(target.bundle), STAGING_NAME), { recursive: true, force: true }).catch(() => {});
-        set({ state: "error", error: friendlyError(error) });
+        if (job.cancelled) {
+          set({ state: release ? "available" : "idle", progress: 0, error: null });
+        } else {
+          if (error?.permanent) savePrefs({ ...prefs, failedVersion: current.version });
+          set({ state: "error", error: friendlyError(error), progress: 0 });
+        }
       } finally {
-        await fsp.rm(workDir, { recursive: true, force: true }).catch(() => {});
+        // Cleared before any await, in the same tick as the final status, so a check right after is never ignored.
         downloading = null;
+        if (workDir) await fsp.rm(workDir, { recursive: true, force: true }).catch(() => {});
       }
       return getStatus();
     })();
-    return downloading;
+    return job.promise;
   }
 
-  // Synchronous so it can run inside will-quit. Two renames; the second is rolled back if it fails.
+  // Synchronous so it can run inside will-quit. Re-checks the staged bundle on disk, then two renames;
+  // the second is rolled back if it fails.
   function installStaged() {
-    if (!staged) return false;
-    const { staging, app, version } = staged;
-    const backup = join(staging, "SoftConnect-previous.app");
+    const { directory, app, version } = staged;
+    const executable = fs.lstatSync(join(app, EXECUTABLE), { throwIfNoEntry: false });
+    if (!executable?.isFile()) throw new Error("the staged update is incomplete");
+    if (tools.versionSync(app) !== version) throw new Error("the staged update changed after it was verified");
+    // Someone may have installed a newer copy by hand while this one was running.
+    const installed = tools.versionSync(target.bundle);
+    if (installed && !isNewer(version, installed)) throw new Error(`SoftConnect ${installed} is already installed`);
+    const backup = join(stagingRoot(), BACKUP_NAME);
     fs.rmSync(backup, { recursive: true, force: true });
     fs.renameSync(target.bundle, backup);
     try {
@@ -374,35 +502,49 @@ function createUpdater({
       throw error;
     }
     staged = null;
+    fs.rmSync(directory, { recursive: true, force: true });
     savePrefs({ ...prefs, pendingInstall: { from: currentVersion, to: version } });
     set({ state: "installed" });
     return true;
   }
 
+  // Used by "Restart to update" and on quit.
   function installNow() {
+    if (!staged) return false;
+    const { version } = staged;
     try {
       return installStaged();
     } catch (error) {
-      staged = null;
+      discardStaged();
+      savePrefs({ ...prefs, failedVersion: version });
       set({ state: "error", error: `Couldn't install the update: ${friendlyError(error)}` });
       return false;
     }
   }
 
-  function installOnQuit() {
-    return staged ? installNow() : false;
-  }
-
   function setAutoUpdate(enabled) {
-    savePrefs({ ...prefs, autoUpdate: Boolean(enabled) });
-    set({ autoUpdate: Boolean(enabled) });
-    if (enabled && status.state === "available" && status.canInstall) download();
+    const on = Boolean(enabled);
+    savePrefs({ ...prefs, autoUpdate: on });
+    set({ autoUpdate: on });
+    if (on) {
+      if (status.state === "available" && status.canInstall && prefs.failedVersion !== status.latestVersion) download();
+    } else {
+      // Turning automatic updates off withdraws what they fetched on their own; downloads you asked for stay.
+      if (downloading && !downloading.explicit) {
+        downloading.cancelled = true;
+        downloading.controller.abort(new Error("Cancelled"));
+      }
+      if (staged && !staged.explicit) {
+        discardStaged();
+        set({ state: release ? "available" : "idle", progress: 0 });
+      }
+    }
     return getStatus();
   }
 
   async function start() {
-    // Leftovers from an earlier run (an installed update's backup, or an unfinished download).
-    if (target.bundle) await fsp.rm(join(dirname(target.bundle), STAGING_NAME), { recursive: true, force: true }).catch(() => {});
+    // Leftovers from an earlier run: the previous version's backup, or a staged update never installed.
+    if (target.bundle) await fsp.rm(stagingRoot(), { recursive: true, force: true }).catch(() => {});
     if (prefs.pendingInstall) {
       if (prefs.pendingInstall.to === currentVersion) set({ updatedFrom: prefs.pendingInstall.from });
       const { pendingInstall: _done, ...rest } = prefs;
@@ -430,9 +572,9 @@ function createUpdater({
     check,
     download,
     installNow,
-    installOnQuit,
+    installOnQuit: installNow,
     setAutoUpdate,
-    releasePage: () => status.releaseUrl,
+    releasePage: () => (isReleaseUrl(status.releaseUrl) ? status.releaseUrl : null),
     start,
     stop,
   };
@@ -448,6 +590,7 @@ module.exports = {
   createUpdater,
   filePreferences,
   isNewer,
+  isReleaseUrl,
   macTools,
   memoryPreferences,
   verifyManifest,

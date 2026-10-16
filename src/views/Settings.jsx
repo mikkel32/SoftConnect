@@ -41,6 +41,7 @@ function UpdatesPanel({ status, actions }) {
           <strong>{updateSummary(status)}</strong>
           {status.checkedAt && status.state !== "checking" && <small>Last checked {timeFormat.format(status.checkedAt)}</small>}
           {!status.canInstall && status.installBlockedReason && <small>{status.installBlockedReason}</small>}
+          {status.notice && <small>{status.notice}</small>}
         </div>
       </div>
       {showProgress && (

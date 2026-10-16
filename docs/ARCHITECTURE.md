@@ -36,14 +36,17 @@ The renderer's session cancels every HTTP and HTTPS request. Update traffic come
 GitHub release ──► softconnect-update.json + .sig ──► Ed25519 verify (public key in the app)
                                                         │
                    SoftConnect-<v>-mac-<arch>.zip ──────┴─► size + SHA-256 from the manifest
-                                                              │
-         <app folder>/.SoftConnect-update/SoftConnect.app ◄───┘ ditto -x -k
-                    │  bundle id, version, codesign --verify --deep --strict
+                                                              │  (30 s metadata timeout, 60 s download idle timeout)
+   <app folder>/.SoftConnect-update/<v>-XXXXXX/SoftConnect.app ◄┘ ditto -x -k into a fresh folder per attempt
+                    │  not a symlink, bundle id, version, codesign --verify --deep --strict
                     ▼
- will-quit or "Restart to update": rename installed → backup, staged → installed (rolled back on failure)
+ will-quit or "Restart to update": re-check executable, version, and that the installed copy is older;
+ then rename installed → backup, staged → installed (rolled back on failure)
 ```
 
-The release workflow signs the manifest with the `SOFTCONNECT_UPDATE_KEY` secret and refuses to publish if that key does not match the public key committed in `electron/update-key.cjs`, so a release can never be one the shipped apps reject. The updater installs only versions newer than its own, which blocks replaying an older signed release. Ad hoc signing gives no publisher identity, so the Ed25519 key is the trust root for updates; anyone who can both push to `main` and use the repository's Actions secrets can ship an update.
+What installs on quit is always the release the interface shows as ready: a newer or withdrawn release discards the staged one, a failed background check keeps it, and turning automatic updates off withdraws anything they downloaded on their own (downloads the user asked for stay). A release that fails verification after its checksum matched is remembered and not downloaded again automatically. Only one copy of the app runs at a time, so two copies never share the staging folder.
+
+The release workflow has three jobs. `plan` releases only the newest commit on `main` and numbers it one patch above the highest existing tag. `build` runs npm, tests and packaging on macOS and runs the installed app's own bundle checks on the archive; it never sees the signing key. `publish` installs nothing, signs the manifest with the `SOFTCONNECT_UPDATE_KEY` secret using Node built-ins, refuses if that key does not match the public key committed in `electron/update-key.cjs`, and is the only job allowed to create the release. The updater installs only versions newer than its own, which blocks replaying an older signed release. Ad hoc signing gives no publisher identity, so the Ed25519 key is the trust root for updates; anyone who can both push to `main` and use the repository's Actions secrets can ship an update.
 
 SoftConnect does not include VirtualHere binaries, credentials, configuration files, or copied application resources. The user installs the official software separately. The app stores no cloud account or telemetry.
 

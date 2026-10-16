@@ -2,6 +2,9 @@ name: Release
 
 # Every merge to main that changes the app publishes a signed release, and installed copies of
 # SoftConnect download it in the background and install it when they quit.
+#
+# The signing key never shares a job with npm dependencies or build scripts: `build` runs npm and
+# packages the app on macOS; `publish` installs nothing, signs with Node built-ins, and uploads.
 on:
   push:
     branches: [main]
@@ -17,92 +20,151 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release
   cancel-in-progress: false
 
 jobs:
-  signing:
+  plan:
+    # Releases come only from main, including manual runs.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     outputs:
-      enabled: ${{ steps.check.outputs.enabled }}
+      enabled: ${{ steps.plan.outputs.enabled }}
+      version: ${{ steps.plan.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
-      - id: check
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: plan
         env:
-          SOFTCONNECT_UPDATE_KEY: ${{ secrets.SOFTCONNECT_UPDATE_KEY }}
+          # Only whether the secret exists; the key itself never reaches this job.
+          HAS_KEY: ${{ secrets.SOFTCONNECT_UPDATE_KEY != '' }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           if ! node -e "process.exit(require('./electron/update-key.cjs').UPDATE_PUBLIC_KEY ? 0 : 1)"; then
             echo "::notice title=Release skipped::Automatic updates are not set up yet. Run 'npm run update-key' once on a Mac with the GitHub CLI and commit electron/update-key.cjs."
             echo "enabled=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          if [ -z "$SOFTCONNECT_UPDATE_KEY" ]; then
-            echo "::error title=Signing key missing::electron/update-key.cjs has a public key, but the SOFTCONNECT_UPDATE_KEY secret is not set. Run 'npm run update-key' again."
+          if [ "$HAS_KEY" != "true" ]; then
+            echo "::error title=Signing key missing::electron/update-key.cjs has a public key, but the SOFTCONNECT_UPDATE_KEY secret is not set. Restore it from your backup, or rotate with 'npm run update-key -- --rotate' (installed copies then need one manual update)."
             exit 1
           fi
+          # Only the newest commit on main is released, so re-running an old run never publishes old code.
+          head=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)
+          if [ "$head" != "$GITHUB_SHA" ]; then
+            echo "::notice title=Release skipped::$GITHUB_SHA is no longer the head of main; the newer commit releases itself."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # major.minor from package.json; patch is one above the highest released patch for that line.
+          base=$(node -p "require('./package.json').version.split('.').slice(0, 2).join('.')")
+          last=$(git tag --list "v$base.*" | sed "s/^v$base\.//" | grep -E '^[0-9]+$' | sort -n | tail -n 1 || true)
+          version="$base.$(( ${last:-0} + 1 ))"
+          echo "Releasing $version"
           echo "enabled=true" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
-  release:
-    needs: signing
-    if: needs.signing.outputs.enabled == 'true'
+  build:
+    needs: plan
+    if: needs.plan.outputs.enabled == 'true'
     runs-on: macos-15
     timeout-minutes: 30
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
-      - uses: actions/setup-node@v4
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '22'
           cache: npm
       - run: npm ci
       - run: npm test
-
-      # major.minor come from package.json; the patch number is this workflow's run number,
-      # so every merge produces a strictly newer version without a version-bump commit.
-      - name: Choose version
-        id: version
-        run: |
-          base=$(node -p "require('./package.json').version.split('.').slice(0, 2).join('.')")
-          version="$base.$GITHUB_RUN_NUMBER"
-          if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
-            echo "::error::Tag v$version already exists."
-            exit 1
-          fi
-          npm version "$version" --no-git-tag-version
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - run: npm version "$VERSION" --no-git-tag-version --allow-same-version
 
       - name: Release notes
         run: |
+          mkdir -p "$RUNNER_TEMP/release"
           previous=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)
           if [ -n "$previous" ]; then range="$previous..HEAD"; else range=HEAD; fi
-          # -n instead of piping to head: under pipefail, head closing the pipe would fail the step.
-          git log -n 40 --no-merges --format='- %s' "$range" > "$RUNNER_TEMP/release-notes.md"
-          cat "$RUNNER_TEMP/release-notes.md"
+          git log -n 40 --no-merges --format='- %s' "$range" > "$RUNNER_TEMP/release/release-notes.md"
+          cat "$RUNNER_TEMP/release/release-notes.md"
 
       - name: Build and package
         run: npm run pack:mac
         env:
           SOFTCONNECT_PACKAGE_OUT: ${{ runner.temp }}/release
 
+      # The same checks installed copies run before installing, so a release they would reject never ships.
+      - name: Verify the package
+        run: |
+          shopt -s nullglob
+          zips=("$RUNNER_TEMP"/release/SoftConnect-"$VERSION"-mac-*.zip)
+          [ ${#zips[@]} -gt 0 ] || { echo "::error::No archive for $VERSION"; exit 1; }
+          for zip in "${zips[@]}"; do
+            out="$RUNNER_TEMP/verify/$(basename "$zip" .zip)"
+            rm -rf "$out" && mkdir -p "$out"
+            ditto -x -k "$zip" "$out"
+            app="$out/SoftConnect.app"
+            test -d "$app" && test ! -L "$app"
+            test -f "$app/Contents/MacOS/SoftConnect"
+            test "$(plutil -extract CFBundleIdentifier raw -o - "$app/Contents/Info.plist")" = app.softconnect.desktop
+            test "$(plutil -extract CFBundleShortVersionString raw -o - "$app/Contents/Info.plist")" = "$VERSION"
+            codesign --verify --deep --strict "$app"
+            echo "Verified $(basename "$zip")"
+          done
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release
+          path: |
+            ${{ runner.temp }}/release/SoftConnect-${{ needs.plan.outputs.version }}-mac-*.zip
+            ${{ runner.temp }}/release/release-notes.md
+          if-no-files-found: error
+          retention-days: 3
+
+  publish:
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      # Only the signing script and its Node built-in dependencies are used from the checkout; no npm install.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release
+          path: ${{ runner.temp }}/release
+
       - name: Sign update manifest
         env:
           SOFTCONNECT_UPDATE_KEY: ${{ secrets.SOFTCONNECT_UPDATE_KEY }}
-          VERSION: ${{ steps.version.outputs.version }}
-        run: node scripts/release-manifest.mjs "$VERSION" "$RUNNER_TEMP/release" "$RUNNER_TEMP/release-notes.md"
+        run: node scripts/release-manifest.mjs "$VERSION" "$RUNNER_TEMP/release" "$RUNNER_TEMP/release/release-notes.md"
 
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.version.outputs.version }}
         run: |
           gh release create "v$VERSION" \
             "$RUNNER_TEMP"/release/SoftConnect-"$VERSION"-mac-*.zip \
             "$RUNNER_TEMP/release/softconnect-update.json" \
             "$RUNNER_TEMP/release/softconnect-update.json.sig" \
+            --repo "$GITHUB_REPOSITORY" \
             --title "SoftConnect $VERSION" \
-            --notes-file "$RUNNER_TEMP/release-notes.md" \
-            --target "$GITHUB_SHA"
+            --notes-file "$RUNNER_TEMP/release/release-notes.md" \
+            --target "$GITHUB_SHA" \
+            --latest
