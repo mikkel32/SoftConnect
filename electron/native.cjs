@@ -17,6 +17,12 @@ const SERVER_PATHS = [
   join(homedir(), "Applications/VirtualHereServerUniversal.app"),
 ];
 const READ_CACHE_MS = 750;
+// Install locations rarely change; re-resolving them on every poll costs several syscalls per read.
+const PATH_CACHE_MS = 30000;
+// pgrep is a process spawn; the server's running state does not need sub-second freshness.
+const SERVER_STATUS_CACHE_MS = 5000;
+// Spawn failures mean the process never started, so rediscovering the client and retrying is safe.
+const SPAWN_ERRORS = new Set(["ENOENT", "EACCES", "ENOEXEC", "EPERM"]);
 
 const ACTIONS = Object.freeze({
   use: "USE",
@@ -121,12 +127,15 @@ function parseClientList(reply) {
       if (!name) continue;
       const address = match[1];
       const suffix = body.slice(match.index + match[0].length);
+      const inUse = /\bIn[- ]use by\b/i.test(suffix);
+      const localUse = /\bIn[- ]use by you\b/i.test(suffix);
       server.devices.push({
         name,
         address,
-        inUse: /\bIn[- ]use by\b/i.test(suffix),
-        localUse: /\bIn[- ]use by you\b/i.test(suffix),
+        inUse,
+        localUse,
         autoUse: Boolean(autoMarker) || /\bAuto-Use\b/i.test(suffix),
+        owner: inUse && !localUse ? parseOwner(suffix) : null,
         detail: suffix.trim(),
       });
       continue;
@@ -141,6 +150,15 @@ function parseClientList(reply) {
     if (flag) flags[flag[1].toLowerCase().replaceAll(" ", "-")] = flag[2].toLowerCase() === "on";
   }
   return { servers, flags };
+}
+
+function parseOwner(suffix) {
+  const match = suffix.match(/\bIn[- ]use by:?\s*(.*)$/i);
+  if (!match) return null;
+  let owner = match[1].trim();
+  // The client wraps the whole ownership note in parentheses: "(In-use by:Jane (Jane) at 192.168.1.15)".
+  if (suffix.trim().startsWith("(") && owner.endsWith(")")) owner = owner.slice(0, -1).trim();
+  return owner || null;
 }
 
 function parseServerProcesses(reply, serverApp) {
@@ -186,16 +204,27 @@ function createNativeService({ clientPaths = CLIENT_PATHS, serverPaths = SERVER_
   let commandGeneration = 0;
   const pendingReads = new Map();
   const readCache = new Map();
+  let pathCache = null;
+  let serverStatusCache = null;
 
   async function findPaths() {
+    if (pathCache && pathCache.expiresAt > Date.now()) return pathCache.paths;
     const [client, serverApp] = await Promise.all([
       firstAvailable(clientPaths, true),
       firstAvailable(serverPaths),
     ]);
-    return { client, serverApp };
+    const paths = { client, serverApp };
+    // Only a found client is cached, so a fresh install is noticed on the next read.
+    pathCache = client ? { paths, expiresAt: Date.now() + PATH_CACHE_MS } : null;
+    return paths;
   }
 
-  async function executeClient(command, requireOk) {
+  function forgetPaths() {
+    pathCache = null;
+    serverStatusCache = null;
+  }
+
+  async function executeClient(command, requireOk, rediscovered = false) {
     const { client } = await findPaths();
     if (!client) return { available: false, reason: "Install and launch the official VirtualHere client to connect devices" };
     try {
@@ -213,6 +242,11 @@ function createNativeService({ clientPaths = CLIENT_PATHS, serverPaths = SERVER_
       }
       return { available: true, reply, client };
     } catch (error) {
+      // The cached client moved or was removed: look again once instead of surfacing a raw spawn error.
+      if (SPAWN_ERRORS.has(error.code)) {
+        forgetPaths();
+        if (!rediscovered) return executeClient(command, requireOk, true);
+      }
       return { available: false, reason: error.message, client };
     }
   }
@@ -277,7 +311,7 @@ function createNativeService({ clientPaths = CLIENT_PATHS, serverPaths = SERVER_
     return queryClient(parts.join(","), false, requireOk);
   }
 
-  async function serverStatus(serverApp) {
+  async function readServerStatus(serverApp) {
     if (!serverApp) return { installed: false, running: false };
     try {
       const result = await run("/usr/bin/pgrep", ["-fl", "VirtualHereServerUniversal|vhusbdosx"], 3000);
@@ -287,10 +321,34 @@ function createNativeService({ clientPaths = CLIENT_PATHS, serverPaths = SERVER_
     }
   }
 
+  function serverStatus(serverApp) {
+    const cached = serverStatusCache;
+    if (cached && cached.serverApp === serverApp && cached.expiresAt > Date.now()) return cached.task;
+    const task = readServerStatus(serverApp);
+    serverStatusCache = { serverApp, task, expiresAt: Date.now() + SERVER_STATUS_CACHE_MS };
+    return task;
+  }
+
   async function getStatus() {
     const paths = await findPaths();
     const server = await serverStatus(paths.serverApp);
     return { paths, server };
+  }
+
+  // One renderer round trip per refresh: installed components and the client's device list.
+  // A user-initiated refresh passes fresh to bypass the discovery, process and read caches.
+  async function getSnapshot({ fresh = false } = {}) {
+    if (fresh) {
+      forgetPaths();
+      readCache.clear();
+    }
+    const [status, state] = await Promise.allSettled([getStatus(), getState()]);
+    return {
+      status: status.status === "fulfilled" ? status.value : null,
+      state: state.status === "fulfilled"
+        ? state.value
+        : { available: false, servers: [], flags: {}, reason: state.reason?.message || "Client state could not be read" },
+    };
   }
 
   async function openApp(which) {
@@ -299,6 +357,7 @@ function createNativeService({ clientPaths = CLIENT_PATHS, serverPaths = SERVER_
       ? dirname(dirname(dirname(paths.client)))
       : which === "server" ? paths.serverApp : null;
     if (!selected) throw new Error(`Official ${which} application was not found`);
+    forgetPaths();
     const result = await run("/usr/bin/open", ["-a", selected], 6000);
     if (result.code !== 0) throw new Error(result.stderr.trim() || `Could not open the ${which} application`);
     return { opened: true };
@@ -324,7 +383,7 @@ function createNativeService({ clientPaths = CLIENT_PATHS, serverPaths = SERVER_
     }
   }
 
-  return { findPaths, getState, getDetailedState, getStatus, sendCommand, openApp, readServerLog };
+  return { findPaths, getState, getDetailedState, getStatus, getSnapshot, sendCommand, openApp, readServerLog };
 }
 
-module.exports = { createNativeService, parseClientList, parseClientStateXml, parseServerProcesses };
+module.exports = { createNativeService, parseClientList, parseClientStateXml, parseServerProcesses, run };

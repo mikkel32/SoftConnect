@@ -1,15 +1,17 @@
 {
   "name": "softconnect",
   "productName": "SoftConnect",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
+  "type": "module",
   "description": "A local desktop control center for compatible USB sharing clients",
   "main": "electron/main.cjs",
   "scripts": {
     "build": "vite build",
     "start": "npm run build && electron .",
     "pack:mac": "npm run build && node scripts/package.mjs",
-    "test": "node --test tests/*.test.cjs"
+    "test": "node --test tests/*.test.cjs tests/*.test.js",
+    "update-key": "node scripts/update-key.mjs"
   },
   "dependencies": {
     "fast-xml-parser": "5.11.2"
